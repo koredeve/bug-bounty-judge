@@ -1,5 +1,7 @@
 import json
 
+POOL_FUNDING = 60 * 10**18
+
 CRITICAL = 50 * 10**18
 HIGH = 20 * 10**18
 MEDIUM = 8 * 10**18
@@ -19,10 +21,16 @@ PAGE_BODY = "<html><body><script>alert(document.cookie)</script></body></html>"
 
 def _deploy(direct_vm, direct_deploy, owner):
     direct_vm.sender = owner
-    return direct_deploy("contracts/BugBountyJudge.py")
+    contract = direct_deploy("contracts/BugBountyJudge.py")
+    contract.approve_poc_domain("https://poc.example.com/", "Example PoC host")
+    return contract
 
 
 def _set_program(direct_vm, contract, owner):
+    direct_vm.sender = owner
+    direct_vm.value = POOL_FUNDING
+    contract.fund_pool()
+    direct_vm.value = 0
     direct_vm.sender = owner
     contract.set_program(RULES_TEXT, CRITICAL, HIGH, MEDIUM, LOW)
 

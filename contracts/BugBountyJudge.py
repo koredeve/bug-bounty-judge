@@ -94,6 +94,8 @@ class BugBountyJudge(gl.Contract):
 	reports: TreeMap[str, Report]
 	report_ids: DynArray[str]
 	credits: TreeMap[Address, u256]
+	pool: u256
+	approved_poc_domains: TreeMap[str, str]
 
 	def __init__(self) -> None:
 		self.rules_text = ""
@@ -124,6 +126,37 @@ class BugBountyJudge(gl.Contract):
 	@gl.public.view
 	def get_payout(self, sev: str) -> u256:
 		return self.payouts.get(str(sev), u256(0))
+
+	@gl.public.write
+	def approve_poc_domain(self, url_prefix: str, name: str) -> None:
+		self._require_owner()
+		if not str(url_prefix).startswith("https://"):
+			raise gl.vm.UserError(f"{ERROR_EXPECTED} PoC domain prefix must be an https URL")
+		self.approved_poc_domains[str(url_prefix)] = str(name)
+
+	@gl.public.write
+	def revoke_poc_domain(self, url_prefix: str) -> None:
+		self._require_owner()
+		if str(url_prefix) not in self.approved_poc_domains:
+			raise gl.vm.UserError(f"{ERROR_EXPECTED} PoC domain prefix is not approved")
+		del self.approved_poc_domains[str(url_prefix)]
+
+	@gl.public.view
+	def get_poc_domains(self) -> dict:
+		prefixes = []
+		for prefix in self.approved_poc_domains.keys():
+			prefixes.append(str(prefix))
+		return {"prefixes": prefixes}
+
+	@gl.public.view
+	def get_pool(self) -> u256:
+		return self.pool
+
+	@gl.public.write.payable
+	def fund_pool(self) -> None:
+		if gl.message.value == u256(0):
+			raise gl.vm.UserError(f"{ERROR_EXPECTED} Send GEN with the call")
+		self.pool = self.pool + gl.message.value
 
 	@gl.public.write
 	def set_program(
@@ -159,23 +192,34 @@ class BugBountyJudge(gl.Contract):
 	) -> None:
 		if len(self.rules_text) == 0:
 			raise gl.vm.UserError(f"{ERROR_EXPECTED} No bug bounty program defined")
-		if report_id in self.reports:
-			raise gl.vm.UserError(f"{ERROR_EXPECTED} Report id already exists")
-		if len(title) == 0 or len(description) == 0:
+		clean_id = str(report_id).strip()
+		clean_title = str(title).strip()
+		clean_desc = str(description).strip()
+		if len(clean_id) == 0 or len(clean_title) == 0 or len(clean_desc) == 0:
 			raise gl.vm.UserError(
 				f"{ERROR_EXPECTED} Title and description must not be empty"
 			)
-		self.reports[report_id] = Report(
+		if clean_id in self.reports:
+			raise gl.vm.UserError(f"{ERROR_EXPECTED} Report id already exists")
+		url = str(poc_url).strip()
+		approved = False
+		for prefix in self.approved_poc_domains.keys():
+			if url.startswith(str(prefix)):
+				approved = True
+				break
+		if not approved:
+			raise gl.vm.UserError(f"{ERROR_EXPECTED} PoC URL domain is not owner-approved")
+		self.reports[clean_id] = Report(
 			researcher=gl.message.sender_address,
-			title=title,
-			description=description,
-			poc_url=poc_url,
+			title=clean_title,
+			description=clean_desc,
+			poc_url=url,
 			status=STATUS_SUBMITTED,
 			severity="",
 			award_atto=u256(0),
 			reasoning="",
 		)
-		self.report_ids.append(report_id)
+		self.report_ids.append(clean_id)
 
 	@gl.public.write
 	def adjudicate(self, report_id: str) -> None:
@@ -237,13 +281,9 @@ class BugBountyJudge(gl.Contract):
 				return _handle_leader_error(leaders_res, leader_fn)
 			leader_data = leaders_res.calldata
 			fresh = leader_fn()
-			leader_rank = ranks.get(leader_data.get("severity"))
-			fresh_rank = ranks.get(fresh.get("severity"))
-			if leader_rank is None or fresh_rank is None:
-				return False
-			return bool(leader_data.get("valid")) == bool(fresh.get("valid")) and abs(
-				int(leader_rank) - int(fresh_rank)
-			) <= 1
+			leader_sev = str(leader_data.get("severity", "")).strip().lower()
+			fresh_sev = str(fresh.get("severity", "")).strip().lower()
+			return bool(leader_data.get("valid")) == bool(fresh.get("valid")) and leader_sev == fresh_sev
 
 		result = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
 
@@ -251,6 +291,11 @@ class BugBountyJudge(gl.Contract):
 		report.reasoning = str(result["reasoning"])
 		if bool(result["valid"]):
 			award = self.payouts.get(report.severity, u256(0))
+			if self.pool < u256(award):
+				raise gl.vm.UserError(
+					f"{ERROR_EXPECTED} Insufficient bounty pool to fund this award"
+				)
+			self.pool = self.pool - u256(award)
 			report.status = STATUS_ACCEPTED
 			report.award_atto = u256(award)
 			self._credit(report.researcher, u256(award))
